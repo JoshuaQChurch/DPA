@@ -1,14 +1,10 @@
 #include "utilities.h"
 #include <mpi.h>
 #include <iostream>
-#include <vector> 
-#include <algorithm> 
 
 using std::cerr ;
 using std::cout ;
 using std::endl ;
-using std::vector ; 
-using std::copy ;
 
 /******************************************************************************
 * numprocs:  number of processors                                             *
@@ -39,72 +35,265 @@ inline unsigned int log2(unsigned int i) {
 * See Program 4.7 page 162 of the text.                                       *
 ******************************************************************************/
 
-void AllToAll(int send_value[], int recv_buffer[], int size, MPI_Comm comm) {
-    //MPI_Allgather(send_value,size,MPI_INT,recv_buffer,size,MPI_INT,comm) ;
-
-    // MPI Primitives 
-    MPI_Status status ;
-    const int PHYSICAL_PROC = 0 ; 
-    const int VIRTUAL_PROC = 1 ; 
+void AllToAll(int send_value[], int recv_buffer[], int size, MPI_Comm comm){
     
-    // Each processor has a buffer to store all messages
-    // received, along with the initial message to 
-    // be sent 
-    vector<int> results (numprocs*size, -1) ; 
+    // MPI_Allgather(send_value,size,MPI_INT,recv_buffer,size,MPI_INT,comm) ;
+    
+    // MPI Primitives 
+    MPI_Status status ; 
+    int TAG_SEND = 0, TAG_RECV = 0 ; 
 
-    // This ensures that the message is placed in the 
-    // correct index position 
-    int offset = myid*size ; 
+    int max_size = pow2(16) ;               // Maximum message size 
+    int dimension = log2(numprocs) ;        // Hypercube dimension
+    int proc_total = pow2(dimension) ;      // Physical & Virtual proc count
+    int partner = 0 ;                       // Hypercube partner id 
+    int virtual_id = 0 ;                    // Virtual id for non-physical procs
+    int msg_size = size ;                   // Original message size 
+    int i, j, k = 0 ;                       // Loop iterators   
+    bool has_virtual_id = false ;           // Boolean to determine if physical proc has a virtual proc
+    int host_proc = 0 ;                     // Physical processor id that's hosting a virtual processor          
 
-    // Copy the id's initial message into the buffer 
-    copy(send_value, send_value + size, results.begin() + offset) ;
+    // Buffers
+    int *physical_buffer = new int[proc_total*max_size] ;    // Buffer to store physical processors information
+    int *virtual_buffer = new int[proc_total*max_size] ;     // Buffer to store virtual buffer hosted on physical proc
+    int *recv_phys_msg ;                                     // Temp buffer to handle recv with physical procs
+    int *recv_virt_msg ;                                     // Temp buffer to handle recv with virtual procs
 
-    // The dimension of the hypercube 
-    int dimension = log2(numprocs) ; 
+    for (i=0; i<size; ++i) { 
+        physical_buffer[i] = send_value[i] ;
+        virtual_buffer[i] = send_value[i] ; 
+    }
 
-    for (int i=0; i<dimension; ++i, size *=2) {
-        int partner = myid ^ pow2(i) ; 
+    // Check to see if the number of processors 
+    // is a power of 2 
+    if (numprocs > 0) {
 
-        MPI_Sendrecv(send_value, size, MPI_INT, partner, PHYSICAL_PROC,
-            recv_buffer, size, MPI_INT, partner, PHYSICAL_PROC, comm, &status) ; 
-
-        // Append the received values to the results buffer
-        offset = partner*size ; 
-        copy(recv_buffer, recv_buffer + size, results.begin() + offset) ;
-
-        cout << "id: " << myid << endl;
-        for (int k=0; k<size; ++k)
-            cout << send_value[k] ; 
+        // Boolean to determine if the number of procs 
+        // is a valid power of 2. 
+        bool power2 = ((numprocs & (numprocs - 1)) == 0) ;
         
-        cout << endl; 
+        // If the supplied amount of processors is 
+        // not a power of 2 ... 
+        if (!power2) {
+
+            // Processor 0 will always be connected to physical processors;
+            // therefore, we skip it. 
+            if (myid != 0) {
+                /*
+                    Let us use the example of 3 procs. The next 
+                    power of 2 will be 4. The mapped virtual processor
+                    should be hosted on the lesser half of the 
+                    dimension divide. 
+
+                    2 --------- 3
+                    |           |           
+                    |           |
+                ---------------------         
+                    |           |
+                    |           |
+                    0 ---------- 1
+                */
+
+                // Find the next closest power of 2. 
+                int next_pow2_dim = pow2(log2(numprocs)) ; 
+
+                // Verify it falls into the lower half 
+                // of the divide 
+                if (myid < next_pow2_dim / 2) {
+
+                    // Map the virtual proc to the appropriate physical proc
+                    virtual_id = myid ^ (pow2(dimension-1)) ; 
+                    has_virtual_id = true ; 
+
+                } // end if (myid < next_pow2_dim / 2)
+            } // end if (myid != 0) 
+        } // end if (!power2) 
+    } // end if (numprocs > 0) 
+
+    // Perform All-To-All Hypercube Algorithm 
+    for(i=0; i<dimension; ++i, size*=2) {
+        
+        // Determine the communication partner 
+        partner = myid ^ pow2(i) ; 
+
+        // Temp buffers to handle messages 
+        recv_phys_msg = new int[numprocs*max_size];
+        recv_virt_msg = new int[numprocs*max_size];
+    
+        // Current physical processor is hosting a virtual
+        // procssor and attempting to communicate with the 
+        // virtual proc. 
+        if ((partner == virtual_id) && has_virtual_id) {
+
+            // Append the virtual proc message 
+            // before the physical proc message 
+            if (myid > partner) {
+                for (j=0; j<size; ++j) {
+                    physical_buffer[j+size] = physical_buffer[j] ; 
+                    physical_buffer[j] = virtual_buffer[j] ; 
+                }
+            }
+
+            // Otherwise, append after the virtual proc
+            // message 
+            else {
+                for (j=0; j<size; ++j) {
+                    physical_buffer[j+size] = virtual_buffer[j] ; 
+                }
+            }
+        }
+
+        // Handle physical to physical and 
+        // physical to virtual processors 
+        else {
+
+            // Physical proc to physical proc communication 
+            if (numprocs > partner) {
+                TAG_SEND = partner ; 
+                TAG_RECV = myid ; 
+                
+                MPI_Sendrecv(physical_buffer, max_size*numprocs, MPI_INT, partner, TAG_SEND, 
+                    recv_phys_msg, max_size*numprocs, MPI_INT, partner, TAG_RECV, comm, &status) ; 
+
+                if (myid > partner) {
+                    for (j=0; j<size; ++j) {
+                        physical_buffer[j+size] = physical_buffer[j] ; 
+                        physical_buffer[j] = recv_phys_msg[j] ; 
+                    }
+                }
+
+                else {
+                    for (j=0; j<size; ++j) {
+                        physical_buffer[j+size] = recv_phys_msg[j] ; 
+                    }
+                }
+            }
+
+            // Physical proc to virtual proc communication 
+            else {
+                
+                // Determine the physical processor that
+                // has the virtual partner 
+                host_proc = partner ^ pow2(dimension-1);
+                TAG_SEND = partner ; 
+                TAG_RECV = myid ; 
+        
+                // A physical processor needs to communicate with a virtual processor, so 
+                // we must send the message to the physical (host) location. The host must
+                // take on the role of the virtual process and handle the communication. 
+                MPI_Sendrecv(physical_buffer, max_size*numprocs, MPI_INT, host_proc, TAG_SEND, 
+                    recv_phys_msg, max_size*numprocs, MPI_INT, host_proc, TAG_RECV, comm, &status);
+
+                if (myid > partner) {
+                    for (j=0; j<size; ++j) {
+                        physical_buffer[j+size] = physical_buffer[j] ; 
+                        physical_buffer[j] = recv_phys_msg[j] ; 
+                    }
+                }
+
+                else {
+                    for (j=0; j<size; ++j) {
+                        physical_buffer[j+size] = recv_phys_msg[j] ; 
+                    }
+                }
+            }
+        }
+
+        // After this process has handled its physical process, 
+        // the virtual process it is hosting must be handled. 
+        if (has_virtual_id) {
+
+            partner = virtual_id ^ pow2(i) ; 
+
+            // Check to make sure this processor 
+            // is not trying to communicate with 
+            // the virtual processor it is hosting
+            if (myid != partner) {
+
+                // Virtual proc to physical proc communication 
+                if (partner < numprocs) {
+                    
+                    TAG_SEND = partner ; 
+                    TAG_RECV = virtual_id ; 
+
+                    MPI_Sendrecv(virtual_buffer, max_size*numprocs, MPI_INT, partner, TAG_SEND, 
+                        recv_virt_msg, max_size*numprocs, MPI_INT, partner, TAG_RECV, comm, &status);
+                    
+                    if (virtual_id > partner) {
+                        for (j=0; j<size; ++j) {
+                            virtual_buffer[j+size] = virtual_buffer[j] ; 
+                            virtual_buffer[j] = recv_virt_msg[j] ; 
+                        }
+                    }
+
+                    else {
+                        for (j=0; j<size; ++j) {
+                            virtual_buffer[j+size] = recv_virt_msg[j] ; 
+                        }
+                    }
+                }
+
+                // Check to see if the virtual processor
+                // is attempting to communicate with
+                // another virtual processor 
+                else {
+                    host_proc = partner ^ pow2(dimension - 1);
+                    TAG_SEND = partner ; 
+                    TAG_RECV = virtual_id ; 
+                    
+                    //cout << "before" << endl ; 
+                    MPI_Sendrecv(virtual_buffer, max_size*numprocs, MPI_INT, host_proc, TAG_SEND, 
+                        recv_virt_msg, max_size*numprocs, MPI_INT, host_proc, TAG_RECV, comm, &status);
+
+                    //cout << "not stuck " << endl ; 
+                    if (virtual_id > partner) {
+                        for (j=0; j<size; ++j) {
+                            virtual_buffer[j+size] = virtual_buffer[j] ; 
+                            virtual_buffer[j] = recv_virt_msg[j] ; 
+                        }
+                    }
+
+                    else {
+                        for (j=0; j<size; ++j) {
+                            virtual_buffer[j+size] = recv_virt_msg[j] ; 
+                        }
+                    }
+                }
+            }
+
+            // The physical (hosting) process is communicating 
+            // with the virtual (hosted) process. For this, we 
+            // do not need to using a send/recv call because
+            // the buffer is stored locally. 
+            else {
+
+                if (virtual_id > myid) {
+                    for (j=0; j<size; ++j) {
+                        virtual_buffer[j+size] = virtual_buffer[j] ; 
+                        virtual_buffer[j] = physical_buffer[j] ; 
+                    }
+                }
+
+                else {
+                    for (j=0; j<size; ++j) {
+                        virtual_buffer[j+size] = physical_buffer[j] ; 
+                    }
+                }
+            }
+        }
+
+        delete[] recv_phys_msg ; delete[] recv_virt_msg;
 
     }
 
-    // Copy the results buffer back into the received buffer 
-    copy(results.begin(), results.end(), recv_buffer) ; 
-    for (int i=0; i<size; ++i) {
-        cout << recv_buffer[i] ; 
+    // Relocate the buffer contents to the original
+    // recv_buffer so that we can properly check the 
+    // indices locations. 
+    for (i = 0; i<numprocs*msg_size; ++i){
+        recv_buffer[i] = physical_buffer[i];
     }
-    cout << endl ; 
-  
 
-    MPI_Finalize() ; 
-    exit(0) ; 
-
-    /*
-        All-to-all broadcast on a Hypercube (Pseudocode)
-
-        procedure ALL_TO_ALL_BC_HCUBE(my_id, my_msg, d, result) 
-        begin 
-            result := my_msg;
-            for i:= 0 to d-1 do
-                partner := my_id XOR 2^i; 
-                send result to partner ;
-                receive msg from partner ; 
-                result := result U msg ; 
-            endfor 
-        end ALL_TO_ALL_BC_HCUBE ; 
-    */
+    delete[] physical_buffer ; delete[] virtual_buffer ;
 }
 
 /******************************************************************************
@@ -116,7 +305,85 @@ void AllToAll(int send_value[], int recv_buffer[], int size, MPI_Comm comm) {
 ******************************************************************************/
 
 void AllToAllPersonalized(int send_buffer[], int recv_buffer[], int size, MPI_Comm comm) {
-    MPI_Alltoall(send_buffer,size,MPI_INT,recv_buffer,size,MPI_INT,comm) ;
+    
+    // MPI_Alltoall(send_buffer,size,MPI_INT,recv_buffer,size,MPI_INT,comm) ;
+    
+    // Both flags CANNOT be set true at the same time. 
+    bool run_e_cube_alg = false ; 
+    bool run_mesh_alg = true ; 
+
+    // MPI Primitives 
+    MPI_Status status ; 
+    int TAG_SEND = 0 ;
+    int TAG_RECV = 0 ; 
+
+    int partner = 0 ; 
+    int max_size = pow2(16) ; 
+    int i, j, k = 0 ;
+    int dimension = log2(numprocs) ; 
+
+    // Perform E-Cube Routing Algorithm 
+    if (run_e_cube_alg) {
+
+        for (i=1; i < numprocs; ++i) {
+            
+            partner = myid ^ i;
+
+            MPI_Sendrecv(send_buffer, numprocs*max_size, MPI_INT, partner, TAG_SEND, 
+                recv_buffer, numprocs*max_size, MPI_INT, partner, TAG_RECV, comm, &status);
+
+            for (j=0; j<size; ++j) {
+                send_buffer[partner*size + j] = recv_buffer[myid*size + j] ; 
+            }
+        }
+
+        // Copy the final values to the recv_buffer
+        for (i=0; i<size*numprocs; ++i) {
+            recv_buffer[i] = send_buffer[i] ; 
+        }
+    }
+
+    // Perform Mesh Algorithm 
+    if (run_mesh_alg) {
+ 
+        // This works similiarly to the setup of the 
+        // traditional hypercube algorithm. 
+        for (i=0; i<dimension; ++i) {
+
+            // Establish partner id 
+            partner = myid ^ pow2(i) ;
+            
+            
+            int next = pow2(i) * size ; 
+
+            MPI_Sendrecv(send_buffer, max_size*numprocs, MPI_INT, partner, TAG_SEND, 
+                recv_buffer, max_size*numprocs, MPI_INT, partner, TAG_RECV, comm, &status) ; 
+
+            // Perform the shuffle pattern
+            // The data is contiguous, so we can shuffle information 
+            // by its chunks of data
+            if (myid < partner) {
+                for (j=next; j<size*numprocs; j+=next*2) {
+                    for (k=0; k<next; ++k) {
+                        send_buffer[j+k] = recv_buffer[j-next+k] ; 
+                    }
+                }
+            }
+            else {
+                for (j=0; j<size*numprocs; j+=next*2) {
+                    for (k=0; k<next; ++k) {
+                        send_buffer[j+k] = recv_buffer[j+k+next] ; 
+                    }
+
+                }
+            }
+        }
+
+        // Copy the final values to the recv_buffer 
+        for (i=0; i<size*numprocs; ++i) {
+            recv_buffer[i] = send_buffer[i] ; 
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -149,7 +416,7 @@ int main(int argc, char **argv) {
     if (myid == 0) {
         cout << "Starting " << numprocs << " processors." << endl ;
     }
-
+    
     /***************************************************************************/
     /* Check Timing for Single Node Broadcast emulating an alltoall broadcast  */
     /***************************************************************************/
@@ -192,7 +459,6 @@ int main(int argc, char **argv) {
 
             // Verify that the received message matches 
             // what is to be expected 
-            
             for(int p=0;p<numprocs;++p) {
 	            if(recv_buffer[p*msize] != (p + i*numprocs)) {
                     cerr << "recv failed on processor " << myid << " recv_buffer["
@@ -215,9 +481,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    MPI_Finalize(); 
-    return 0; 
-  
+    // Make sure we don't perform All-to-All personalized 
+    // on non powers of 2
+    if ((numprocs & (numprocs - 1)) != 0) {
+        if (myid == 0) {
+            cout << endl << "WARNING: Cannot perform All-to-All Personalized with non-power of 2 processors." << endl ; 
+        }
+        MPI_Finalize() ; 
+        return 0; 
+    }
+    
     /***************************************************************************/
     /* Check Timing for All to All personalized Broadcast Algorithm            */
     /***************************************************************************/
